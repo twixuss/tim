@@ -1,0 +1,9 @@
+tmp/
+temp/
+.vs/
+bin/
+*.png
+*.bmp
+*.tim
+*.jpg
+*.vcxproj.user
