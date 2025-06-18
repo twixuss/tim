@@ -1,464 +1,431 @@
-#define TL_IMPL
-#include <tl/string.h>
-#include <tl/file.h>
-#include <tl/console.h>
-#include <tl/precise_time.h>
-
 #pragma warning(disable: 4996)
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
-#include <assert.h>
+
+#undef assert
+
+#define TL_DEBUG 0
+
+#define TL_IMPL
+#include <tl/string.h>
+#include <tl/file.h>
+#include <tl/console.h>
+#include <tl/precise_time.h>
+#include <tl/main.h>
+#include <tl/qoi.h>
 
 using namespace tl;
 
+using String = Span<utf8>;
 
-struct Pixel {
-    u8 r, g, b;
+inline constexpr bool operator==(String a, char const *b) { return a == as_utf8(as_span(b)); }
+
+using Pixel = v3u8;
+
+struct Image {
+    Pixel *pixels = 0;
+    v2u size = {};
+
+    Pixel &operator()(s32 x, s32 y) {
+        assert((u32)x < size.x && (u32)y <= size.y);
+        return pixels[y*size.x + x];
+    }
 };
 
-int totalR;
-int totalG;
-int totalB;
-int totalN;
-int totalZero;
-int totalSmall;
-int totalFull;
+struct BitSerializer {
+    u8 *buffer = 0;
+    u8 *cursor = 0;
+    u8 shift = 0;
+    
+    void write_1_bit(u8 value) {
+        *cursor &= ~(1 << shift);
+        *cursor |= (value & 1) << shift;
+        shift += 1;
+        if (shift == 8) {
+            shift = 0;
+            cursor++;
+        }
+    }
+    template <umm count>
+    void write_bits(u64 value) {
+        for (int i = 0; i < count; ++i) {
+            write_1_bit((value >> i) & 1);
+        }
+    }
+    template <umm count>
+    void write_bits_be(u64 value) {
+        for (int i = count - 1; i >= 0; --i) {
+            write_1_bit((value >> i) & 1);
+        }
+    }
 
-#define COUNTERS 0
+    u8 read_1_bit() {
+        u8 result = (*cursor >> shift) & 1;
+        shift += 1;
+        if (shift == 8) {
+            shift = 0;
+            cursor++;
+        }
+        return result;
+    }
+    template <umm count>
+    u64 read_bits() {
+        u64 result = 0;
+        for (int i = 0; i < count; ++i) {
+            result |= ((u64)read_1_bit() << i);
+        }
+        return result;
+    }
+    template <umm count>
+    u64 read_bits_be() {
+        u64 result = 0;
+        for (int i = count - 1; i >= 0; --i) {
+            result |= ((u64)read_1_bit() << i);
+        }
+        return result;
+    }
 
-int n0;
-int n2;
-int n4;
-int n8;
-int histogram[256];
+    Span<u8> span() {
+        if (shift) {
+            return {buffer, cursor + 1};
+        } else {
+            return {buffer, cursor};
+        }
+    }
+};
 
-struct Endecoder {
-    u8 *r_start = 0;
-    u8 *g_start = 0;
-    u8 *b_start = 0;
+umm uncompressed_size = 0;
+umm n_bits0 = 0;
+umm n_bits1 = 0;
+umm n_bits2 = 0;
+umm n_bits4 = 0;
+umm n_bits8 = 0;
 
-    struct Channel {
-        u8 *p = 0;
-        u8 bit : 3 = 0;
+#define profile()                                                                    \
+    auto timer = create_precise_timer();                                             \
+    defer {                                                                          \
+        auto time = elapsed_time(timer);                                             \
+        println("{}ms / {}/s", time * 1000, format_bytes(uncompressed_size / time)); \
     };
 
-    Channel r, g, b;
+void encode_mip(BitSerializer &serializer, Image image) {
+    Pixel *mids = DefaultAllocator{}.allocate<Pixel>(image.size.x * image.size.y / 4);
+    for (int component = 0; component < 3; ++component) {
+        for (umm y = 0; y < image.size.y / 2; ++y) {
+        for (umm x = 0; x < image.size.x / 2; ++x) {
+            auto &p1 = image(x*2 + 0, y*2 + 0).s[component];
+            auto &p2 = image(x*2 + 1, y*2 + 0).s[component];
+            auto &p3 = image(x*2 + 0, y*2 + 1).s[component];
+            auto &p4 = image(x*2 + 1, y*2 + 1).s[component];
 
-    u32 size = 0;
+            auto mn = min(p1, p2, p3, p4);
+            auto mx = max(p1, p2, p3, p4);
 
-public:
-    static Endecoder encoder(u32 w) {
-        Endecoder result;
-        result.size = w;
-        result.r.p = result.r_start = (u8 *)malloc(w*w*2);
-        result.g.p = result.g_start = (u8 *)malloc(w*w*2);
-        result.b.p = result.b_start = (u8 *)malloc(w*w*2);
-        return result;
-    }
-    static Endecoder decoder(Span<char> path) {
-        Endecoder result;
-        auto data = read_entire_file(path);
-        auto p = data.data;
-
-        result.size = *(u32 *)p;
-        p += sizeof(u32);
-
-        auto r_size = *(u32 *)p;
-        p += sizeof(u32);
-
-        auto g_size = *(u32 *)p;
-        p += sizeof(u32);
-
-        result.r.p = p;
-        p += r_size;
-
-        result.g.p = p;
-        p += g_size;
-
-        result.b.p = p;
-
-        return result;
-    }
-    void write(Pixel pixel) {
-        write_channel(r, pixel.r);
-        write_channel(g, pixel.g);
-        write_channel(b, pixel.b);
-    }
-    Pixel read() {
-        return {
-            read_channel(r),
-            read_channel(g),
-            read_channel(b),
-        };
-    }
-    void save(Span<ascii> path) {
-        auto file = open_file(path, {.write = true});
-        defer { close(file); };
-
-        ::write(file, value_as_bytes(size));
-        ::write(file, value_as_bytes((u32)(r.p - r_start)));
-        ::write(file, value_as_bytes((u32)(g.p - g_start)));
-        ::write(file, Span(r_start, r.p));
-        ::write(file, Span(g_start, g.p));
-        ::write(file, Span(b_start, b.p));
-    }
-private:
-    void write_2bits(Channel &c, u8 v) {
-        u8 masks[4] {
-            0b11111100,
-            0b11110011,
-            0b11001111,
-            0b00111111,
-        };
-
-        *c.p &= masks[c.bit >> 1];
-        *c.p |= (v & 3) << c.bit;
-
-        c.bit += 2;
-        c.p += c.bit == 0;
-
-    }
-    u8 read_2bits(Channel &c) {
-        u8 masks[4] {
-            0b00000011,
-            0b00001100,
-            0b00110000,
-            0b11000000,
-        };
-
-        defer {
-            c.bit += 2;
-            c.p += c.bit == 0;
-        };
-        return (*c.p & masks[c.bit >> 1]) >> c.bit;
+            mids[y*image.size.x/2 + x].s[component] = (u8)(((u16)mn + (u16)mx + 1) / 2);
+        }
+        }
     }
 
-    void write_channel(Channel &c, u8 v) {
-        auto zeros = count_leading_zeros(v);
-        auto ones  = count_leading_ones (v);
-        auto leading = max(ones, zeros);
+    if (image.size.x == 2) {
+        serializer.write_bits<8>(mids[0].x);
+        serializer.write_bits<8>(mids[0].y);
+        serializer.write_bits<8>(mids[0].z);
+    } else {
+        encode_mip(serializer, {mids, image.size / 2});
+    }
 
-        // max 2-bit number we can save is 0b(000000)01 (1)
-        // min 2-bit number we can save is 0b(111111)10 (-2)
+    for (int component = 0; component < 3; ++component) {
+        for (smm y = 0; y < image.size.y / 2; ++y) {
+        for (smm x = 0; x < image.size.x / 2; ++x) {
+            auto &p1 = image(x*2 + 0, y*2 + 0).s[component];
+            auto &p2 = image(x*2 + 1, y*2 + 0).s[component];
+            auto &p3 = image(x*2 + 0, y*2 + 1).s[component];
+            auto &p4 = image(x*2 + 1, y*2 + 1).s[component];
 
-        // max 4-bit number we can save is 0b(0000)0111 (7)
-        // min 4-bit number we can save is 0b(1111)1000 (-8)
+            u8 mid = mids[y*image.size.x/2 + x].s[component];
 
-#if COUNTERS
-        histogram[v]++;
-#endif
+            s8 deltas[4];
+            deltas[0] = p1 - mid;
+            deltas[1] = p2 - mid;
+            deltas[2] = p3 - mid;
+            deltas[3] = p4 - mid;
+    
+            u8 bits_required = 0;
+            for (auto delta : deltas) {
+                if (delta == 0) {
+                    // no bits required
+                } else if (-1 <= delta && delta < 1) {
+                    bits_required = max(bits_required, (u8)1);
+                } else if (-2 <= delta && delta < 2) {
+                    bits_required = max(bits_required, (u8)2);
+                } else if (-8 <= delta && delta < 8) {
+                    bits_required = max(bits_required, (u8)4);
+                } else {
+                    bits_required = max(bits_required, (u8)8);
+                    break;
+                }
+            }
 
-        if (v == 0) {
-            write_2bits(c, 0);
-#if COUNTERS
-            ++n0;
-#endif
-        } else if (leading >= 7) {
-            write_2bits(c, 1);
-            write_2bits(c, v);
-#if COUNTERS
-            ++n2;
-#endif
-        } else if (leading >= 5) {
-            write_2bits(c, 2);
-            write_2bits(c, v);
-            write_2bits(c, v >> 2);
-#if COUNTERS
-            ++n4;
-#endif
+            switch (bits_required) {
+                case 0: {
+                    ++n_bits0;
+                    serializer.write_bits_be<3>(0b011);
+                    break;
+                }
+                case 1: {
+                    ++n_bits1;
+                    serializer.write_bits_be<2>(0b11);
+                    for (int i = 0; i < 4; ++i)
+                        serializer.write_bits<1>(deltas[i]);
+                    break;
+                }
+                case 2: {
+                    ++n_bits2;
+                    serializer.write_bits_be<2>(0b10);
+                    for (int i = 0; i < 4; ++i)
+                        serializer.write_bits<2>(deltas[i]);
+                    break;
+                }
+                case 4: {
+                    ++n_bits4;
+                    serializer.write_bits_be<2>(0b00);
+                    for (int i = 0; i < 4; ++i)
+                        serializer.write_bits<4>(deltas[i]);
+                    break;
+                }
+                case 8: {
+                    ++n_bits8;
+                    serializer.write_bits_be<3>(0b010);
+                    for (int i = 0; i < 4; ++i)
+                        serializer.write_bits<8>(deltas[i]);
+                    break;
+                }
+                default: invalid_code_path();
+            }
+        }
+        }
+    }
+}
+
+void encode(BitSerializer &serializer, Image in) {
+    profile();
+
+    serializer.write_bits<32>(in.size.x);
+    serializer.write_bits<32>(in.size.y);
+
+    encode_mip(serializer, in);
+}
+
+Pixel *decode_mip(BitSerializer &serializer, v2u size, Pixel *prev_mip) {
+    Pixel *mip = DefaultAllocator{}.allocate<Pixel>(size.x * size.y);
+
+    return mip;
+}
+
+Image decode(BitSerializer &serializer) {
+    Image out = {};
+    out.size.x = serializer.read_bits<32>();
+    out.size.y = serializer.read_bits<32>();
+    
+    uncompressed_size = out.size.x * out.size.y * sizeof(Pixel);
+
+    profile();
+
+    auto buffer_in  = DefaultAllocator{}.allocate<Pixel>(out.size.x * out.size.y);
+    auto buffer_out = DefaultAllocator{}.allocate<Pixel>(out.size.x * out.size.y);
+
+    buffer_out[0].s[0] = serializer.read_bits<8>();
+    buffer_out[0].s[1] = serializer.read_bits<8>();
+    buffer_out[0].s[2] = serializer.read_bits<8>();
+    
+    umm mip_count = log2(out.size.x) + 1;
+    for (umm i = 1; i < mip_count; ++i) {
+        auto mip_size = V2u(1 << i);
+
+        Swap(buffer_in, buffer_out);
+
+        for (int component = 0; component < 3; ++component) {
+            for (smm y = 0; y < mip_size.y / 2; ++y) {
+            for (smm x = 0; x < mip_size.x / 2; ++x) {
+                u8 mid = buffer_in[y * out.size.x + x].s[component];
+                s8 deltas[4];
+
+                if (serializer.read_bits<1>() == 1) {
+                    if (serializer.read_bits<1>() == 1) {
+                        struct X { s8 value : 1; } x;
+                        for (int i = 0; i < 4; ++i) {
+                            deltas[i] = x.value = serializer.read_bits<1>();
+                        }
+                    } else {
+                        struct X { s8 value : 2; } x;
+                        for (int i = 0; i < 4; ++i) {
+                            deltas[i] = x.value = serializer.read_bits<2>();
+                        }
+                    }
+                } else if (serializer.read_bits<1>() == 1) {
+                    if (serializer.read_bits<1>() == 1) {
+                        for (int i = 0; i < 4; ++i) {
+                            deltas[i] = 0;
+                        }
+                    } else {
+                        for (int i = 0; i < 4; ++i) {
+                            deltas[i] = serializer.read_bits<8>();
+                        }
+                    }
+                } else {
+                    struct X { s8 value : 4; } x;
+                    for (int i = 0; i < 4; ++i) {
+                        deltas[i] = x.value = serializer.read_bits<4>();
+                    }
+                }
+                
+                buffer_out[(y*2 + 0) * out.size.x + (x*2 + 0)].s[component] = deltas[0] + mid;
+                buffer_out[(y*2 + 0) * out.size.x + (x*2 + 1)].s[component] = deltas[1] + mid;
+                buffer_out[(y*2 + 1) * out.size.x + (x*2 + 0)].s[component] = deltas[2] + mid;
+                buffer_out[(y*2 + 1) * out.size.x + (x*2 + 1)].s[component] = deltas[3] + mid;
+            }
+            }
+        }
+    }
+    
+    out.pixels = buffer_out;
+
+    return out;
+}
+
+void usage() {
+    println("Usage: tim [encode(default)|decode] <input> -o <output>");
+    println("  encode");
+    println("    Convert image to tim");
+    println("  decode");
+    println("    Convert tim to other format");
+}
+
+s32 tl_main(Span<String> args) {
+    if (args.count == 1) {
+        usage();
+        return 1;
+    }
+    String input_path;
+    String output_path;
+
+    bool should_encode = true;
+    bool bench = false;
+
+    for (umm i = 0; i < args.count; ++i) {
+        if (args[i] == "help") {
+            usage();
+        } else if (args[i] == "-o") {
+            ++i;
+            if (i >= args.count) {
+                println("Expected an output path after -o");
+                return 1;
+            }
+            output_path = args[i];
+        } else if (args[i] == "encode") {
+            should_encode = true;
+        } else if (args[i] == "decode") {
+            should_encode = false;
+        } else if (args[i] == "bench") {
+            bench = true;
         } else {
-            write_2bits(c, 3);
-            write_2bits(c, v);
-            write_2bits(c, v >> 2);
-            write_2bits(c, v >> 4);
-            write_2bits(c, v >> 6);
-#if COUNTERS
-            ++n8;
-#endif
-        }
-    }
-    u8 read_channel(Channel &c) {
-        switch (read_2bits(c)) {
-            case 0: return 0;
-            case 1: {
-                u8 v = read_2bits(c);
-                v |= v & 0b00000010 ? 0b11111100 : 0;
-                return v;
-            }
-            case 2: {
-                u8 v = read_2bits(c);
-                v |= read_2bits(c) << 2;
-                v |= v & 0b00001000 ? 0b11110000 : 0;
-                return v;
-            }
-            case 3: {
-                u8 v = read_2bits(c);
-                v |= read_2bits(c) << 2;
-                v |= read_2bits(c) << 4;
-                v |= read_2bits(c) << 6;
-                return v;
-            }
+            input_path = args[i];
         }
     }
 
-};
-
-u32 const remove_bits = 0;
-
-void decode() {
-    auto decoder = Endecoder::decoder("result.tim"s);
-
-    auto w = decoder.size, h = w;
-    auto pixels = new Pixel[w*w];
-
-    {
-        auto layer = decoder.read();
-        for (int y = 0; y < w; ++y) {
-            for (int x = 0; x < w; ++x) {
-                pixels[y*w + x] = layer;
-            }
-        }
-    }
-     //stbi_write_bmp("tmp/decoded1.bmp", w, h, 3, pixels);
-
-    for (int s = 2; s <= w; s *= 2) {
-
-        for (int py = 0; py < s; ++py) {
-            for (int px = 0; px < s; ++px) {
-
-                auto layer = decoder.read();
-                for (int y = h*py/s; y < h*(py+1)/s; ++y) {
-                    for (int x = w*px/s; x < w*(px+1)/s; ++x) {
-                        auto &pixel = pixels[y*w + x];
-                        pixel.r += layer.r;
-                        pixel.g += layer.g;
-                        pixel.b += layer.b;
-                    }
-                }
-
-            }
-        }
-
-        char pathbuf[256];
-        sprintf(pathbuf, "tmp/decoded%d.bmp", s);
-        //stbi_write_bmp(pathbuf, w, h, 3, pixels);
+    if (!input_path) {
+        println("Provide a path to input image");
+        return 1;
     }
 
-
-    for (int y = 0; y < w; ++y) {
-        for (int x = 0; x < w; ++x) {
-            auto &pixel = pixels[y*w + x];
-            pixel.r <<= remove_bits;
-            pixel.g <<= remove_bits;
-            pixel.b <<= remove_bits;
+    if (!output_path) {
+        if (should_encode) {
+            output_path = format(u8"{}.tim", parse_path(input_path).path_without_extension());
+        } else {
+            println("Provide a path to output image using -o flag. I need to know the extension.");
+            return 1;
         }
     }
 
+    
+    if (should_encode) {
+        println("encoding");
 
-    stbi_write_bmp("decoded.bmp", w, h, 3, pixels);
-}
+        Image in;
+        in.pixels = autocast stbi_load(autocast null_terminate(input_path).data, autocast &in.size.x, autocast &in.size.y, 0, 3);
 
-void encode() {
-    int w, h;
-    auto pixels = (Pixel *)stbi_load("test.png", &w, &h, 0, 3);
-    assert(w == h && _mm_popcnt_u32(w) == 1);
+        if (in.size.x == in.size.y && is_power_of_2(in.size.x)) {
+            // ok
+        } else {
+            println("Only power of two square images are supported currently");
+            return 1;
+        }
+    
+        uncompressed_size = in.size.x * in.size.y * sizeof(Pixel);
+        
+        BitSerializer serializer;
+        constexpr u32 times_more_that_uncompressed = 2; // should be big enough
+        serializer.buffer = DefaultAllocator{}.allocate<u8>(uncompressed_size * times_more_that_uncompressed);
+        serializer.cursor = serializer.buffer;
 
-    auto writer = Endecoder::encoder(w);
+           
+        encode(serializer, in);
 
-    for (int y = 0; y < w; ++y) {
-        for (int x = 0; x < w; ++x) {
-            auto &pixel = pixels[y*w + x];
-            pixel.r >>= remove_bits;
-            pixel.g >>= remove_bits;
-            pixel.b >>= remove_bits;
+
+        auto n_bits_sum = n_bits0 + n_bits1 + n_bits2 + n_bits4 + n_bits8;
+
+        println("Compressed size: {} ({}% of uncompressed)", format_bytes(serializer.span().count), serializer.span().count * 100.0f / uncompressed_size);
+        println("    n_bits0: {} ({}%)", n_bits0, n_bits0 * 100.0f / n_bits_sum);
+        println("    n_bits1: {} ({}%)", n_bits1, n_bits1 * 100.0f / n_bits_sum);
+        println("    n_bits2: {} ({}%)", n_bits2, n_bits2 * 100.0f / n_bits_sum);
+        println("    n_bits4: {} ({}%)", n_bits4, n_bits4 * 100.0f / n_bits_sum);
+        println("    n_bits8: {} ({}%)", n_bits8, n_bits8 * 100.0f / n_bits_sum);
+
+        write_entire_file(output_path, serializer.span());
+    } else {
+        println("decoding");
+
+        BitSerializer serializer;
+        serializer.buffer = read_entire_file(input_path).data;
+        serializer.cursor = serializer.buffer;
+
+
+        Image out = decode(serializer);
+        
+        if (ends_with(output_path, u8".bmp"s)) {
+            stbi_write_bmp(autocast null_terminate(output_path).data, out.size.x, out.size.y, 3, out.pixels);
+        } else if (ends_with(output_path, u8".png"s)) {
+            stbi_write_png(autocast null_terminate(output_path).data, out.size.x, out.size.y, 3, out.pixels, out.size.x * sizeof(Pixel));
+        } else if (ends_with(output_path, u8".jpg"s)) {
+            stbi_write_jpg(autocast null_terminate(output_path).data, out.size.x, out.size.y, 3, out.pixels, 100);
+        } else if (ends_with(output_path, u8".tga"s)) {
+            stbi_write_tga(autocast null_terminate(output_path).data, out.size.x, out.size.y, 3, out.pixels);
+        } else if (ends_with(output_path, u8".qoi"s)) {
+            write_entire_file(output_path, qoi::encode(out.pixels, out.size));
+        } else {
+            println("Unknown output extension");
+            return 1;
         }
     }
 
-    {
-        Pixel mn = {255,255,255};
-        Pixel mx = {0,0,0};
+    if (bench) {
+        void *pixels;
+        int x,y;
+        println("bmp");{profile();pixels = stbi_load("tests/test.bmp", &x, &y, 0, 3);}{profile();stbi_write_bmp("tests/garbage.bmp", 4096, 4096, 3, pixels);}
+        println("png");{profile();         stbi_load("tests/test.png", &x, &y, 0, 3);}{profile();stbi_write_png("tests/garbage.png", 4096, 4096, 3, pixels, 4096*3);}
+        println("jpg");{profile();         stbi_load("tests/test.jpg", &x, &y, 0, 3);}{profile();stbi_write_jpg("tests/garbage.jpg", 4096, 4096, 3, pixels, 100);}
+        println("tga");{profile();         stbi_load("tests/test.tga", &x, &y, 0, 3);}{profile();stbi_write_tga("tests/garbage.tga", 4096, 4096, 3, pixels);}
+        println("qoi");{profile();         qoi::decode(read_entire_file("tests/test.qoi"s));}{profile();qoi::encode((v3u8 *)pixels, v2u{4096, 4096}); }
 
-        for (int y = 0; y < w; ++y) {
-            for (int x = 0; x < w; ++x) {
-                auto pixel = pixels[y*w + x];
-                mn.r = min(mn.r, pixel.r);
-                mn.g = min(mn.g, pixel.g);
-                mn.b = min(mn.b, pixel.b);
-                mx.r = max(mx.r, pixel.r);
-                mx.g = max(mx.g, pixel.g);
-                mx.b = max(mx.b, pixel.b);
-            }
-        }
-
-        Pixel layer {
-            mn.r + (mx.r - mn.r) / 2,
-            mn.g + (mx.g - mn.g) / 2,
-            mn.b + (mx.b - mn.b) / 2,
-        };
-
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                auto &pixel = pixels[y*w + x];
-                pixel.r -= layer.r;
-                pixel.g -= layer.g;
-                pixel.b -= layer.b;
-            }
-        }
-        //stbi_write_bmp("tmp/avg1.bmp", 1, 1, 3, &layer);
-
-        writer.write(layer);
+        umm size = 0;
+        size = get_file_size("tests/test.bmp"s).value_or(0); println("bmp {} {}", format_bytes(size), size * 100.0f / uncompressed_size);
+        size = get_file_size("tests/test.png"s).value_or(0); println("png {} {}", format_bytes(size), size * 100.0f / uncompressed_size);
+        size = get_file_size("tests/test.jpg"s).value_or(0); println("jpg {} {}", format_bytes(size), size * 100.0f / uncompressed_size);
+        size = get_file_size("tests/test.tga"s).value_or(0); println("tga {} {}", format_bytes(size), size * 100.0f / uncompressed_size);
+        size = get_file_size("tests/test.qoi"s).value_or(0); println("qoi {} {}", format_bytes(size), size * 100.0f / uncompressed_size);
     }
 
-    for (int s = 2; s <= w; s *= 2) {
-        auto layer_pixels = new Pixel[s*s];
-        for (int py = 0; py < s; ++py) {
-            for (int px = 0; px < s; ++px) {
-                Pixel mn = {127,127,127};
-                Pixel mx = {-128,-128,-128};
-                for (int y = h*py/s; y < h*(py+1)/s; ++y) {
-                    for (int x = w*px/s; x < w*(px+1)/s; ++x) {
-                        auto pixel = pixels[y*w + x];
-                        mn.r = min((s8)mn.r, (s8)pixel.r);
-                        mn.g = min((s8)mn.g, (s8)pixel.g);
-                        mn.b = min((s8)mn.b, (s8)pixel.b);
-                        mx.r = max((s8)mx.r, (s8)pixel.r);
-                        mx.g = max((s8)mx.g, (s8)pixel.g);
-                        mx.b = max((s8)mx.b, (s8)pixel.b);
-                    }
-                }
-                Pixel layer {
-                    mn.r + ((s8)(mx.r - mn.r) >> 1),
-                    mn.g + ((s8)(mx.g - mn.g) >> 1),
-                    mn.b + ((s8)(mx.b - mn.b) >> 1),
-                };
-                for (int y = h*py/s; y < h*(py+1)/s; ++y) {
-                    for (int x = w*px/s; x < w*(px+1)/s; ++x) {
-                        auto &pixel = pixels[y*w + x];
-                        pixel.r -= layer.r;
-                        pixel.g -= layer.g;
-                        pixel.b -= layer.b;
-                    }
-                }
-
-                layer_pixels[py*s + px] = layer;
-
-                // printf("%d: [%d, %d]: min: {%d, %d, %d}, max: {%d, %d, %d}\n", s, px, py, mn.r, mn.g, mn.b, mx.r, mx.g, mx.b);
-                writer.write(layer);
-            }
-        }
-
-        char pathbuf[256];
-
-
-        for (int y = 0; y < s; ++y) {
-            for (int x = 0; x < s; ++x) {
-                auto &pixel = layer_pixels[y*s + x];
-                pixel.r += 128;
-                pixel.g += 128;
-                pixel.b += 128;
-            }
-        }
-        sprintf(pathbuf, "tmp/avg%d.bmp", s);
-        //stbi_write_bmp(pathbuf, s, s, 3, layer_pixels);
-        for (int y = 0; y < s; ++y) {
-            for (int x = 0; x < s; ++x) {
-                auto &pixel = layer_pixels[y*s + x];
-                pixel.r -= 128;
-                pixel.g -= 128;
-                pixel.b -= 128;
-            }
-        }
-
-
-
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                auto &pixel = pixels[y*w + x];
-                pixel.r += 128;
-                pixel.g += 128;
-                pixel.b += 128;
-            }
-        }
-        sprintf(pathbuf, "tmp/layer%d.bmp", s);
-        //stbi_write_bmp(pathbuf, w, h, 3, pixels);
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                auto &pixel = pixels[y*w + x];
-                pixel.r -= 128;
-                pixel.g -= 128;
-                pixel.b -= 128;
-            }
-        }
-    }
-    writer.save("result.tim"s);
-}
-
-int main() {
-    init_allocator();
-    init_printer();
-
-    /*
-         0  1  2  3  4  5  6  7  min = 0
-         8  9 10 11 12 13 14 15  max = 63
-        16 17 18 19 20 21 22 23  avg = 0 + (63 - 0)/2 = 31
-        24 25 26 27 28 29 30 31
-        32 33 34 35 36 37 38 39
-        40 41 42 43 44 45 46 47
-        48 49 50 51 52 53 54 55
-        56 57 58 59 60 61 62 63
-
-        store avg.
-
-        -31 -30 -29 -28 min = -31 |  -27 -26 -25 -24 min = ...
-        -23 -22 -21 -20 max = -4  |  -19 -18 -17 -16 max = ...
-        -15 -14 -13 -12 avg = -18 |  -11 -10  -9  -8 avg = ...
-         -7  -6  -5  -4           |   -3  -2  -1   0
-        ==========================|=================
-          1   2   3   4 min = ... |    5   6   7   8 min = ...
-          9  10  11  12 max = ... |   13  14  15  16 max = ...
-         17  18  19  20 avg = ... |   21  22  23  24 avg = ...
-         25  26  27  28           |   29  30  31  32
-
-         -13 -12  | -11 -10  |  -9  -8 | -7  -6
-          -5  -4  |  -3  -2  |  -1   0 |  1   2
-        ==========|==========|=========|=======
-           3   4  |   5   6  |   7   8 |  9  10
-          11  12  |  13  14  |  15  16 | 17  18
-        ==========|==========|=========|=======
-          19  20  |  21  22  |  23  24 | 25  26
-        ==========|==========|=========|=======
-          27  28  |  29  30  |  31  32 | 33  34
-          35  36  |  37  38  |  39  40 | 41  42
-          43  44  |  45  46  |  47  48 | 49  50
-    */
-
-
-    //for (int y = 0; y < 8; ++y) {
-    //    for (int x = 0; x < 8; ++x) {
-    //        printf("%3d ", y*8 + x - 31 + 18);
-    //    }
-    //    printf("\n");
-    //}
-
-    {
-        auto timer = create_precise_timer();
-        defer { print("Encoding: {} ms\n", elapsed_time(timer) * 1000); };
-
-        encode();
-    }
-
-    // print("Average written pixel: ({}, {}, {})\n", totalR/totalN, totalG/totalN, totalB/totalN);
-    print("n0: {}\nn2: {}\nn4: {}\nn8: {}\n", n0, n2, n4, n8);
-    for (int i = 0; i < 256; ++i) {
-        print("{}: {}\n", i, histogram[i]);
-    }
-
-    {
-        auto timer = create_precise_timer();
-        defer { print("Decoding: {} ms\n", elapsed_time(timer) * 1000); };
-
-        decode();
-    }
+    return 0;
 }
