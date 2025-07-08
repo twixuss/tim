@@ -43,10 +43,8 @@ struct BitSerializer {
         *cursor &= ~(1 << shift);
         *cursor |= (value & 1) << shift;
         shift += 1;
-        if (shift == 8) {
-            shift = 0;
-            cursor++;
-        }
+        cursor += shift == 8;
+        shift &= 7;
     }
     template <umm count>
     void write_bits(u64 value) {
@@ -64,10 +62,8 @@ struct BitSerializer {
     u8 read_1_bit() {
         u8 result = (*cursor >> shift) & 1;
         shift += 1;
-        if (shift == 8) {
-            shift = 0;
-            cursor++;
-        }
+        cursor += shift == 8;
+        shift &= 7;
         return result;
     }
     template <umm count>
@@ -295,6 +291,29 @@ Image decode(BitSerializer &serializer) {
     return out;
 }
 
+namespace tim {
+
+Image decode(char const *path) {
+    BitSerializer serializer;
+    serializer.buffer = read_entire_file(as_span(path)).data;
+    serializer.cursor = serializer.buffer;
+
+    return decode(serializer);
+}
+
+void encode(char const *path, Image image) {
+    BitSerializer serializer;
+    constexpr u32 times_more_that_uncompressed = 2; // should be big enough
+    serializer.buffer = DefaultAllocator{}.allocate<u8>(uncompressed_size * times_more_that_uncompressed);
+    serializer.cursor = serializer.buffer;
+           
+    encode(serializer, image);
+
+    write_entire_file(as_span(path), serializer.span());
+}
+
+}
+
 void usage() {
     println("Usage: tim [encode(default)|decode] <input> -o <output>");
     println("  encode");
@@ -350,6 +369,134 @@ s32 tl_main(Span<String> args) {
     }
 
     
+    if (bench) {
+        struct BenchmarkResult {
+            char const *name;
+            f64 load_secs;
+            f64 store_secs;
+            umm file_size;
+            f64 load_speed() { return uncompressed_size / load_secs; }
+            f64 store_speed() { return uncompressed_size / store_secs; }
+        };
+
+        StaticList<BenchmarkResult, 6> benchmarks = {};
+
+        void *pixels;
+        int x,y;
+		auto timer = create_precise_timer();
+        const int reps = 9;
+        
+		auto run_benchmark = [&](char const *ext, auto load, auto store, auto free) {
+            auto &b = benchmarks.add({ext});
+            b.file_size = get_file_size(tformat("tests/test.{}"s, ext)).value();
+            println(b.name);
+            for (int i = 0; i < reps; ++i) {
+                print("{} / {}\r", i + 1, reps);
+                reset(timer);
+			    auto pixels = load(tformat("tests/test.{}\0"s, ext).data);
+			    b.load_secs += reset(timer);
+			    store(tformat("tests/test.{}\0"s, ext).data, pixels);
+                b.store_secs += reset(timer);
+                free(pixels);
+                if (i == 0) {
+                    b.load_secs = b.store_secs = 0;
+                }
+            }
+            b.load_secs /= reps - 1;
+            b.store_secs /= reps - 1;
+		};
+
+        
+        run_benchmark("bmp", 
+            [&](char const *path) { return stbi_load(path, &x, &y, 0, 3); },
+            [&](char const *path, stbi_uc *pixels) { return stbi_write_bmp("tests/garbage.bmp", x, y, 3, pixels); },
+            [&](void *pixels) { return stbi_image_free(pixels); }
+        );
+
+        run_benchmark("png", 
+            [&](char const *path) { return stbi_load(path, &x, &y, 0, 3); },
+            [&](char const *path, stbi_uc *pixels) { return stbi_write_png("tests/garbage.png", x, y, 3, pixels, x * 3); },
+            [&](void *pixels) { return stbi_image_free(pixels); }
+        );
+
+        run_benchmark("jpg", 
+            [&](char const *path) { return stbi_load(path, &x, &y, 0, 3); },
+            [&](char const *path, stbi_uc *pixels) { return stbi_write_jpg("tests/garbage.jpg", x, y, 3, pixels, 100); },
+            [&](void *pixels) { return stbi_image_free(pixels); }
+        );
+
+        run_benchmark("tga", 
+            [&](char const *path) { return stbi_load(path, &x, &y, 0, 3); },
+            [&](char const *path, stbi_uc *pixels) { return stbi_write_tga("tests/garbage.tga", x, y, 3, pixels); },
+            [&](void *pixels) { return stbi_image_free(pixels); }
+        );
+        
+        run_benchmark("qoi", 
+            [&](char const *path) { return qoi::decode(read_entire_file(as_span(path))).value(); },
+            [&](char const *path, qoi::Image img) { write_entire_file(as_span(path), qoi::encode(img.pixels, img.size)); },
+            [&](qoi::Image &pixels) { return qoi::free(pixels); }
+        );
+
+        run_benchmark("tim", 
+            [&](char const *path) { return tim::decode(path); },
+            [&](char const *path, Image img) { tim::encode(path, img); },
+            [&](Image &pixels) { /* TODO */ }
+        );
+        
+        quick_sort(benchmarks.span(), [](BenchmarkResult r) { return r.file_size; });
+        println("Format|Size|Percentage|Graph");
+        println("-|-|-|-");
+        for (auto b : benchmarks) {
+            println("{}|{}|{}%|`{}`",
+                b.name,
+                FormatFloat{.value = format_bytes(b.file_size), .precision = 0},
+                b.file_size * 100 / benchmarks.back().file_size,
+                Repeat{'=', b.file_size * 20 / benchmarks.back().file_size}
+            );
+        }
+        println();
+
+        quick_sort(benchmarks.span(), [](BenchmarkResult r) { return r.load_secs; });
+        println("Format|Enc. speed|Percentage|Graph");
+        println("-|-|-|-");
+        for (auto b : benchmarks) {
+            println("{}|{}/s|{}%|`{}`",
+                b.name,
+                FormatFloat{.value = format_bytes(b.load_speed()), .precision = 0},
+                (u64)b.load_speed() * 100 / (u64)benchmarks.front().load_speed(),
+                Repeat{'=', (umm)(b.load_speed() * 20 / benchmarks.front().load_speed())}
+            );
+        }
+        println();
+
+        quick_sort(benchmarks.span(), [](BenchmarkResult r) { return r.store_secs; });
+        println("Format|Dec. speed|Percentage|Graph");
+        println("-|-|-|-");
+        for (auto b : benchmarks) {
+            println("{}|{}/s|{}%|`{}`",
+                b.name,
+                FormatFloat{.value = format_bytes(b.store_speed()), .precision = 0},
+                (u64)b.store_speed() * 100 / (u64)benchmarks.front().store_speed(),
+                Repeat{'=', (umm)(b.store_speed() * 20 / benchmarks.front().store_speed())}
+            );
+        }
+        println();
+
+        //println("bmp");{profile();pixels = stbi_load("tests/test.bmp", &x, &y, 0, 3);}{profile();stbi_write_bmp("tests/garbage.bmp", 4096, 4096, 3, pixels);}
+        //println("png");{profile();         stbi_load("tests/test.png", &x, &y, 0, 3);}{profile();stbi_write_png("tests/garbage.png", 4096, 4096, 3, pixels, 4096*3);}
+        //println("jpg");{profile();         stbi_load("tests/test.jpg", &x, &y, 0, 3);}{profile();stbi_write_jpg("tests/garbage.jpg", 4096, 4096, 3, pixels, 100);}
+        //println("tga");{profile();         stbi_load("tests/test.tga", &x, &y, 0, 3);}{profile();stbi_write_tga("tests/garbage.tga", 4096, 4096, 3, pixels);}
+        //println("qoi");{profile();         qoi::decode(read_entire_file("tests/test.qoi"s));}{profile();qoi::encode((v3u8 *)pixels, v2u{4096, 4096}); }
+        //
+        //umm size = 0;
+        //size = get_file_size("tests/test.bmp"s).value_or(0); println("bmp {} {}", format_bytes(size), size * 100.0f / uncompressed_size);
+        //size = get_file_size("tests/test.png"s).value_or(0); println("png {} {}", format_bytes(size), size * 100.0f / uncompressed_size);
+        //size = get_file_size("tests/test.jpg"s).value_or(0); println("jpg {} {}", format_bytes(size), size * 100.0f / uncompressed_size);
+        //size = get_file_size("tests/test.tga"s).value_or(0); println("tga {} {}", format_bytes(size), size * 100.0f / uncompressed_size);
+        //size = get_file_size("tests/test.qoi"s).value_or(0); println("qoi {} {}", format_bytes(size), size * 100.0f / uncompressed_size);
+        return 0;
+    }
+
     if (should_encode) {
         println("encoding");
 
@@ -408,23 +555,6 @@ s32 tl_main(Span<String> args) {
             println("Unknown output extension");
             return 1;
         }
-    }
-
-    if (bench) {
-        void *pixels;
-        int x,y;
-        println("bmp");{profile();pixels = stbi_load("tests/test.bmp", &x, &y, 0, 3);}{profile();stbi_write_bmp("tests/garbage.bmp", 4096, 4096, 3, pixels);}
-        println("png");{profile();         stbi_load("tests/test.png", &x, &y, 0, 3);}{profile();stbi_write_png("tests/garbage.png", 4096, 4096, 3, pixels, 4096*3);}
-        println("jpg");{profile();         stbi_load("tests/test.jpg", &x, &y, 0, 3);}{profile();stbi_write_jpg("tests/garbage.jpg", 4096, 4096, 3, pixels, 100);}
-        println("tga");{profile();         stbi_load("tests/test.tga", &x, &y, 0, 3);}{profile();stbi_write_tga("tests/garbage.tga", 4096, 4096, 3, pixels);}
-        println("qoi");{profile();         qoi::decode(read_entire_file("tests/test.qoi"s));}{profile();qoi::encode((v3u8 *)pixels, v2u{4096, 4096}); }
-
-        umm size = 0;
-        size = get_file_size("tests/test.bmp"s).value_or(0); println("bmp {} {}", format_bytes(size), size * 100.0f / uncompressed_size);
-        size = get_file_size("tests/test.png"s).value_or(0); println("png {} {}", format_bytes(size), size * 100.0f / uncompressed_size);
-        size = get_file_size("tests/test.jpg"s).value_or(0); println("jpg {} {}", format_bytes(size), size * 100.0f / uncompressed_size);
-        size = get_file_size("tests/test.tga"s).value_or(0); println("tga {} {}", format_bytes(size), size * 100.0f / uncompressed_size);
-        size = get_file_size("tests/test.qoi"s).value_or(0); println("qoi {} {}", format_bytes(size), size * 100.0f / uncompressed_size);
     }
 
     return 0;
