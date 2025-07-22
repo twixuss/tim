@@ -13,6 +13,7 @@
 
 #if !TL_DEBUG
 #define bounds_check(...)
+#define ASSERTION_FAILURE(...) 0
 #endif
 
 #define TL_IMPL
@@ -409,14 +410,23 @@ UNIT_TEST {
 	assert(_mm_extract_epi8(a, 15) == 0   >> 2);
 };
 
+forceinline u32 clz(u8 x) {
+	int n = 8;
+	unsigned y;
+
+	y = x >> 4; if (y != 0) { n = n - 4; x = y; }
+	y = x >> 2; if (y != 0) { n = n - 2; x = y; }
+	y = x >> 1; if (y != 0) { n = n - 1; x = y; }
+	return n - x;
+}
 forceinline __m128i count_leading_zeros_epi8(__m128i x) {
 	__m128i n = _mm_set1_epi8(8);
 	__m128i y;
 	__m128i m;
 
-	y = shift_right_epi8<4>(x); m = _mm_cmpeq_epi16(y, _mm_setzero_si128()); n = _mm_blendv_epi8(_mm_sub_epi8(n, _mm_set1_epi8(4)), n, m); x = _mm_blendv_epi8(y, x, m);
-	y = shift_right_epi8<2>(x); m = _mm_cmpeq_epi16(y, _mm_setzero_si128()); n = _mm_blendv_epi8(_mm_sub_epi8(n, _mm_set1_epi8(2)), n, m); x = _mm_blendv_epi8(y, x, m);
-	y = shift_right_epi8<1>(x); m = _mm_cmpeq_epi16(y, _mm_setzero_si128()); n = _mm_blendv_epi8(_mm_sub_epi8(n, _mm_set1_epi8(1)), n, m); x = _mm_blendv_epi8(y, x, m);
+	y = shift_right_epi8<4>(x); m = _mm_cmpeq_epi8(y, _mm_setzero_si128()); n = _mm_blendv_epi8(_mm_sub_epi8(n, _mm_set1_epi8(4)), n, m); x = _mm_blendv_epi8(y, x, m);
+	y = shift_right_epi8<2>(x); m = _mm_cmpeq_epi8(y, _mm_setzero_si128()); n = _mm_blendv_epi8(_mm_sub_epi8(n, _mm_set1_epi8(2)), n, m); x = _mm_blendv_epi8(y, x, m);
+	y = shift_right_epi8<1>(x); m = _mm_cmpeq_epi8(y, _mm_setzero_si128()); n = _mm_blendv_epi8(_mm_sub_epi8(n, _mm_set1_epi8(1)), n, m); x = _mm_blendv_epi8(y, x, m);
 	return _mm_sub_epi8(n, x);
 }
 forceinline __m256i count_leading_zeros_epi8(__m256i x) {
@@ -424,24 +434,43 @@ forceinline __m256i count_leading_zeros_epi8(__m256i x) {
 	__m256i y;
 	__m256i m;
 
-	y = shift_right_epi8<4>(x); m = _mm256_cmpeq_epi16(y, _mm256_setzero_si256()); n = _mm256_blendv_epi8(_mm256_sub_epi8(n, _mm256_set1_epi8(4)), n, m); x = _mm256_blendv_epi8(y, x, m);
-	y = shift_right_epi8<2>(x); m = _mm256_cmpeq_epi16(y, _mm256_setzero_si256()); n = _mm256_blendv_epi8(_mm256_sub_epi8(n, _mm256_set1_epi8(2)), n, m); x = _mm256_blendv_epi8(y, x, m);
-	y = shift_right_epi8<1>(x); m = _mm256_cmpeq_epi16(y, _mm256_setzero_si256()); n = _mm256_blendv_epi8(_mm256_sub_epi8(n, _mm256_set1_epi8(1)), n, m); x = _mm256_blendv_epi8(y, x, m);
+	y = shift_right_epi8<4>(x); m = _mm256_cmpeq_epi8(y, _mm256_setzero_si256()); n = _mm256_blendv_epi8(_mm256_sub_epi8(n, _mm256_set1_epi8(4)), n, m); x = _mm256_blendv_epi8(y, x, m);
+	y = shift_right_epi8<2>(x); m = _mm256_cmpeq_epi8(y, _mm256_setzero_si256()); n = _mm256_blendv_epi8(_mm256_sub_epi8(n, _mm256_set1_epi8(2)), n, m); x = _mm256_blendv_epi8(y, x, m);
+	y = shift_right_epi8<1>(x); m = _mm256_cmpeq_epi8(y, _mm256_setzero_si256()); n = _mm256_blendv_epi8(_mm256_sub_epi8(n, _mm256_set1_epi8(1)), n, m); x = _mm256_blendv_epi8(y, x, m);
 	return _mm256_sub_epi8(n, x);
 }
 UNIT_TEST {
-	__m128i a = _mm_setr_epi8(0,1,2,4,8,16,32,64,128,0,0,0,0,0,0,0);
+	for (int i = 0; i < 256; ++i) {
+		assert(clz((u8)i) == count_leading_zeros((u8)i));
+	}
+	for (int i = 0; i < 256; i += 16) {
+		__m128i a = _mm_add_epi8(_mm_set1_epi8(i), _mm_setr_epi8(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15));
+		a = count_leading_zeros_epi8(a);
+		assert(_mm_extract_epi8(a, 0) == clz((u8)(i + 0)));
+		assert(_mm_extract_epi8(a,  1) == clz((u8)(i +  1)));
+		assert(_mm_extract_epi8(a,  2) == clz((u8)(i +  2)));
+		assert(_mm_extract_epi8(a,  3) == clz((u8)(i +  3)));
+		assert(_mm_extract_epi8(a,  4) == clz((u8)(i +  4)));
+		assert(_mm_extract_epi8(a,  5) == clz((u8)(i +  5)));
+		assert(_mm_extract_epi8(a,  6) == clz((u8)(i +  6)));
+		assert(_mm_extract_epi8(a,  7) == clz((u8)(i +  7)));
+		assert(_mm_extract_epi8(a,  8) == clz((u8)(i +  8)));
+		assert(_mm_extract_epi8(a,  9) == clz((u8)(i +  9)));
+		assert(_mm_extract_epi8(a, 10) == clz((u8)(i + 10)));
+		assert(_mm_extract_epi8(a, 11) == clz((u8)(i + 11)));
+		assert(_mm_extract_epi8(a, 12) == clz((u8)(i + 12)));
+		assert(_mm_extract_epi8(a, 13) == clz((u8)(i + 13)));
+		assert(_mm_extract_epi8(a, 14) == clz((u8)(i + 14)));
+		assert(_mm_extract_epi8(a, 15) == clz((u8)(i + 15)));
+	}
+
+	u8 arr[] = {0x00,0x00,0x00,0x00,0x7f,0x31,0x18,0x7e,0x39,0x21,0x7e,0x40,0x27,0x7f,0x3c,0x2b};
+	__m128i a = _mm_loadu_si128((__m128i *)arr);
 	a = count_leading_zeros_epi8(a);
-	
-	assert(_mm_extract_epi8(a, 0) == 8);
-	assert(_mm_extract_epi8(a, 1) == 7);
-	assert(_mm_extract_epi8(a, 2) == 6);
-	assert(_mm_extract_epi8(a, 3) == 5);
-	assert(_mm_extract_epi8(a, 4) == 4);
-	assert(_mm_extract_epi8(a, 5) == 3);
-	assert(_mm_extract_epi8(a, 6) == 2);
-	assert(_mm_extract_epi8(a, 7) == 1);
-	assert(_mm_extract_epi8(a, 8) == 0);
+	for (umm i = 0; i < 16; ++i) {
+		auto expected = clz(arr[i]);
+		assert(((u8 *)&a)[i] == expected);
+	}
 };
 
 void compute_mids_impl_scalar(Image image, Pixel *mids) {
@@ -694,6 +723,8 @@ umm allocate_row_offsets(BitSerializer &serializer, Image image) {
 	return pointer;
 }
 
+#define SIMD_WRITE_DELTAS 1
+
 void write_deltas(BitSerializer &serializer, Image image, Pixel *mids, umm row_offsets_pointer) {
 	u64 avg_bits_required = 0;
 	u64 avg_bits_required_div = 0;
@@ -709,12 +740,143 @@ void write_deltas(BitSerializer &serializer, Image image, Pixel *mids, umm row_o
 		free(serializers);
 	};
 	
-	serializers.resize(image.size.y / 2 * 3);
-	for (auto &serializer : serializers) {
-		serializer.buffer = serializer.cursor = DefaultAllocator{}.allocate<u8>(image.size.x / 2 * 3 * 2);
-	}
+	serializers.resize(image.size.y / 2);
 	#endif
 
+	// TODO: implement avx2
+
+	// TODO: detect cpu feature and dispatch.
+	#if SIMD_WRITE_DELTAS
+	for (smm y = 0; y < image.size.y / 2; ++y) {
+		#if !THREADED_ENCODING
+		// In previously allocated table write the number of bits needed to skip to get to the beggining of this row.
+		serializer.write_bits_at<32>(row_offsets_pointer + y*32, serializer.current_bit_index() - row_offsets_pointer);
+		#endif
+
+		#if THREADED_ENCODING
+		thread_pool += [=, &serializer = serializers[y]]() mutable {
+			serializer.buffer = serializer.cursor = DefaultAllocator{}.allocate<u8>(image.size.x / 2 * 3 * 35 / 8 + 64);
+		#endif
+			for (smm x = 0; x < image.size.x / 2; x += 4) {
+				// 4 quads:
+				// 
+				//   ab  ef  ij  mn
+				//   cd  gh  kl  op
+					
+				__m128i r1 = _mm_loadu_si128((__m128i *)&image(x*2, y*2 + 0) + 0); // jx iz iy ix fz fy fx ez ey ex bz by bx az ay ax
+				__m128i r2 = _mm_loadu_si128((__m128i *)&image(x*2, y*2 + 1) + 0); // lx kz ky kx hz hy hx gz gy gx dz dy dx cz cy cx
+				__m128i r3 = _mm_loadu_si128((__m128i *)&image(x*2, y*2 + 0) + 1); // ?? ?? ?? ?? ?? ?? ?? ?? nz ny nx mz my mx jz jy
+				__m128i r4 = _mm_loadu_si128((__m128i *)&image(x*2, y*2 + 1) + 1); // ?? ?? ?? ?? ?? ?? ?? ?? pz py px oz oy ox lz ly
+
+				__m128i w1 = _mm_or_si128(
+					_mm_shuffle_epi8(r1, _mm_set_epi8(-1,-1,-1,-1,-1,-1,-1,14,13,12, 8, 7, 6, 2, 1, 0)),
+					_mm_shuffle_epi8(r3, _mm_set_epi8(-1,-1,-1,-1, 4, 3, 2,-1,-1,-1,-1,-1,-1,-1,-1,-1)));
+				__m128i w2 = _mm_or_si128(
+					_mm_shuffle_epi8(r1, _mm_set_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,15,11,10, 9, 5, 4, 3)),
+					_mm_shuffle_epi8(r3, _mm_set_epi8(-1,-1,-1,-1, 7, 6, 5, 1, 0,-1,-1,-1,-1,-1,-1,-1)));
+				__m128i w3 = _mm_or_si128(
+					_mm_shuffle_epi8(r2, _mm_set_epi8(-1,-1,-1,-1,-1,-1,-1,14,13,12, 8, 7, 6, 2, 1, 0)),
+					_mm_shuffle_epi8(r4, _mm_set_epi8(-1,-1,-1,-1, 4, 3, 2,-1,-1,-1,-1,-1,-1,-1,-1,-1)));
+				__m128i w4 = _mm_or_si128(
+					_mm_shuffle_epi8(r2, _mm_set_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,15,11,10, 9, 5, 4, 3)),
+					_mm_shuffle_epi8(r4, _mm_set_epi8(-1,-1,-1,-1, 7, 6, 5, 1, 0,-1,-1,-1,-1,-1,-1,-1)));
+				// __ __ __ __ mz my mx iz iy ix ez ey ex az ay ax
+				// __ __ __ __ nz ny nx jz jy jx fz fy fx bz by bx
+				// __ __ __ __ oz oy ox kz ky kx gz gy gx cz cy cx
+				// __ __ __ __ pz py px lz ly lx hz hy hx dz dy dx
+
+				__m128i mid = _mm_loadu_si128((__m128i *)&mids[y * image.size.x / 2 + x]);
+				// ??? ??? ??? ??? m4z m4y m4x m3z m3y m3x m2z m2y m2x m1z m1y m1x
+
+				w1 = _mm_sub_epi8(w1, mid);
+				w2 = _mm_sub_epi8(w2, mid);
+				w3 = _mm_sub_epi8(w3, mid);
+				w4 = _mm_sub_epi8(w4, mid);
+				
+				alignas(16) s8 deltas[64];
+				_mm_store_si128((__m128i *)deltas + 0, w1);
+				_mm_store_si128((__m128i *)deltas + 1, w2);
+				_mm_store_si128((__m128i *)deltas + 2, w3);
+				_mm_store_si128((__m128i *)deltas + 3, w4);
+				
+				__m128i wdmin = _mm_min_epi8(_mm_min_epi8(w1, w2), _mm_min_epi8(w3, w4));
+				__m128i wdmax = _mm_max_epi8(_mm_max_epi8(w1, w2), _mm_max_epi8(w3, w4));
+				
+				__m128i wtable = _mm_setr_epi8(8,8,8,8,8,4,4,2,1,-1,-1,-1,-1,-1,-1,-1);
+				__m128i wdmaxabs = _mm_max_epi8(_mm_sub_epi8(_mm_set1_epi8(-1), wdmin), wdmax);
+				__m128i windices = count_leading_zeros_epi8(wdmaxabs);
+				__m128i wbits_required = _mm_shuffle_epi8(wtable, windices);
+				wbits_required = _mm_and_si128(
+					wbits_required, 
+					_mm_xor_si128(
+						_mm_and_si128(
+							_mm_cmpeq_epi8(_mm_setzero_si128(), wdmin), 
+							_mm_cmpeq_epi8(wdmax, _mm_setzero_si128())
+						),
+						_mm_set1_epi8(-1)
+					)
+				);
+
+				// NOTE: Least significant bit is written first.
+				//       If read one by one, these literals will read right to left by decoder.
+				for (int q = 0; q < min(4, (int)image.size.x / 2); ++q) {
+					for (int c = 0; c < 3; ++c) {
+						u8 bits_required = ((u8 *)&wbits_required)[q*3 + c];
+						switch (bits_required) {
+							case 0: {
+								++n_bits0;
+								serializer.write_bits<1>(0b0);
+								break;
+							}
+							case 1: {
+								++n_bits1;
+								u64 data = 0b001
+									| ((deltas[16*0 + q*3 + c] & 1) << (3+1*0))
+									| ((deltas[16*1 + q*3 + c] & 1) << (3+1*1))
+									| ((deltas[16*2 + q*3 + c] & 1) << (3+1*2))
+									| ((deltas[16*3 + q*3 + c] & 1) << (3+1*3));
+								serializer.write_bits<3 + 4*1>(data);
+								break;
+							}
+							case 2: {
+								++n_bits2;
+								u64 data = 0b101
+									| ((deltas[16*0 + q*3 + c] & 3) << (3+2*0))
+									| ((deltas[16*1 + q*3 + c] & 3) << (3+2*1))
+									| ((deltas[16*2 + q*3 + c] & 3) << (3+2*2))
+									| ((deltas[16*3 + q*3 + c] & 3) << (3+2*3));
+								serializer.write_bits<3 + 4*2>(data);
+								break;
+							}
+							case 4: {
+								++n_bits4;
+								u64 data = 0b011
+									| ((deltas[16*0 + q*3 + c] & 15) << (3+4*0))
+									| ((deltas[16*1 + q*3 + c] & 15) << (3+4*1))
+									| ((deltas[16*2 + q*3 + c] & 15) << (3+4*2))
+									| ((deltas[16*3 + q*3 + c] & 15) << (3+4*3));
+								serializer.write_bits<3 + 4*4>(data);
+								break;
+							}
+							case 8: {
+								++n_bits8;
+								u64 data = 0b111
+									| ((u64)(u8)deltas[16*0 + q*3 + c] << (3+8*0))
+									| ((u64)(u8)deltas[16*1 + q*3 + c] << (3+8*1))
+									| ((u64)(u8)deltas[16*2 + q*3 + c] << (3+8*2))
+									| ((u64)(u8)deltas[16*3 + q*3 + c] << (3+8*3));
+								serializer.write_bits<3 + 4*8>(data);
+								break;
+							}
+						}
+					}
+				}
+			}
+		#if THREADED_ENCODING
+		};
+		#endif
+	}
+	#else
 	for (int component = 0; component < 3; ++component) {
 		for (smm y = 0; y < image.size.y / 2; ++y) {
 			#if !THREADED_ENCODING
@@ -767,8 +929,9 @@ void write_deltas(BitSerializer &serializer, Image image, Pixel *mids, umm row_o
 
 					#if 1
 
-					u8 table[] = {1,2,4,4,8,8,8,8,8,8,8,8};
-					u8 bits_required = table[8 - count_leading_zeros(max((s8)-(dmin+1), dmax))];
+					u8 table[] = {8,8,8,8,8,4,4,2,1};
+
+					u8 bits_required = table[count_leading_zeros(max((s8)-(dmin+1), dmax))];
 					bits_required = ((0 == dmin) & (dmax == 0)) ? 0 : bits_required;
 
 					#else
@@ -846,6 +1009,7 @@ void write_deltas(BitSerializer &serializer, Image image, Pixel *mids, umm row_o
 			#endif
 		}
 	}
+	#endif
 	
 	#if THREADED_ENCODING
 	thread_pool.wait_for_completion(WaitForCompletionOption::do_any_task);
@@ -859,7 +1023,11 @@ void write_deltas(BitSerializer &serializer, Image image, Pixel *mids, umm row_o
 	}
 	#endif
 
+	#if SIMD_WRITE_DELTAS
+	serializer.write_bits_at<32>(row_offsets_pointer + image.size.y/2*32, serializer.current_bit_index() - row_offsets_pointer);
+	#else
 	serializer.write_bits_at<32>(row_offsets_pointer + (3*image.size.y/2)*32, serializer.current_bit_index() - row_offsets_pointer);
+	#endif
 
 	umm uncompressed_size = image.size.x * image.size.y * 24;
 	umm written_bits = serializer.current_bit_index() - bits_before;
@@ -929,6 +1097,8 @@ void encode(BitSerializer &serializer, Image image, v2u unpadded_size) {
 		}
 	}
 
+	//println("Encoding first {} mips", mips_to_write);
+
 	serializer.write_bits_at<mip_count_field_size>(mip_count_pointer, mips_to_write);
 
 	Image last_mip = mips_to_write ? mips[mips_to_write-1].mids : image;
@@ -996,6 +1166,82 @@ Image decode(BitSerializer &serializer) {
 
 		umm row_offsets_pointer = serializer.current_bit_index();
 
+		#if SIMD_WRITE_DELTAS
+		for (smm y = 0; y < mip_size.y; ++y) {
+			thread_pool += [=] () mutable {
+				serializer.skip(y * 32);
+				u64 to_skip = serializer.read_bits<32>();
+				serializer.set_current_bit_index(row_offsets_pointer + to_skip);
+				for (smm x = 0; x < mip_size.x; x += 4) {
+					s8 deltas[64];
+					
+					for (int i = 0; i < min(4, (int)mip_size.x); ++i) {
+						for (int c = 0; c < 3; ++c) {
+							if (serializer.read_bits<1>() == 1) {
+								if (serializer.read_bits<1>() == 1) {
+									if (serializer.read_bits<1>() == 1) {
+										// 111
+										u32 data = serializer.read_bits<32>();
+										deltas[16*0 + 3*i + c] = data >>  0;
+										deltas[16*1 + 3*i + c] = data >>  8;
+										deltas[16*2 + 3*i + c] = data >> 16;
+										deltas[16*3 + 3*i + c] = data >> 24;
+									} else {
+										// 110
+										u16 data = serializer.read_bits<16>();
+										deltas[16*0 + 3*i + c] = (s8)((data << 4) & 0xf0) >> 4;
+										deltas[16*1 + 3*i + c] = (s8)((data << 0) & 0xf0) >> 4;
+										deltas[16*2 + 3*i + c] = (s8)((data >> 4) & 0xf0) >> 4;
+										deltas[16*3 + 3*i + c] = (s8)((data >> 8) & 0xf0) >> 4;
+									}
+								} else {
+									if (serializer.read_bits<1>() == 1) {
+										// 101
+										u8 data = serializer.read_bits<8>();
+										deltas[16*0 + 3*i + c] = (s8)((data << 6) & 0xc0) >> 6;
+										deltas[16*1 + 3*i + c] = (s8)((data << 4) & 0xc0) >> 6;
+										deltas[16*2 + 3*i + c] = (s8)((data << 2) & 0xc0) >> 6;
+										deltas[16*3 + 3*i + c] = (s8)((data << 0) & 0xc0) >> 6;
+									} else {
+										// 100
+										u8 data = serializer.read_bits<4>();
+										deltas[16*0 + 3*i + c] = (s8)((data << 7) & 0x80) >> 7;
+										deltas[16*1 + 3*i + c] = (s8)((data << 6) & 0x80) >> 7;
+										deltas[16*2 + 3*i + c] = (s8)((data << 5) & 0x80) >> 7;
+										deltas[16*3 + 3*i + c] = (s8)((data << 4) & 0x80) >> 7;
+									}
+								}
+							} else {
+								// 0
+								deltas[16*0 + 3*i + c] = 0;
+								deltas[16*1 + 3*i + c] = 0;
+								deltas[16*2 + 3*i + c] = 0;
+								deltas[16*3 + 3*i + c] = 0;
+							}
+						}
+					}
+					
+					// __ __ __ __ mz my mx iz iy ix ez ey ex az ay ax
+					// __ __ __ __ nz ny nx jz jy jx fz fy fx bz by bx
+					// __ __ __ __ oz oy ox kz ky kx gz gy gx cz cy cx
+					// __ __ __ __ pz py px lz ly lx hz hy hx dz dy dx
+					for (int i = 0; i < min(4, (int)mip_size.x); ++i) {
+						for (int c = 0; c < 3; ++c) {
+							buffer_out[(y*2 + 0) * padded_dim + (x*2 + i*2 + 0)].s[c] = deltas[16*0 + 3*i + c] + buffer_in[y * padded_dim + x + i].s[c];
+							buffer_out[(y*2 + 0) * padded_dim + (x*2 + i*2 + 1)].s[c] = deltas[16*1 + 3*i + c] + buffer_in[y * padded_dim + x + i].s[c];
+							buffer_out[(y*2 + 1) * padded_dim + (x*2 + i*2 + 0)].s[c] = deltas[16*2 + 3*i + c] + buffer_in[y * padded_dim + x + i].s[c];
+							buffer_out[(y*2 + 1) * padded_dim + (x*2 + i*2 + 1)].s[c] = deltas[16*3 + 3*i + c] + buffer_in[y * padded_dim + x + i].s[c];
+						}
+					}
+				}
+			};
+		}
+		thread_pool.wait_for_completion(WaitForCompletionOption::do_any_task);
+	
+		serializer.skip(mip_size.y * 32);
+		u64 to_skip = serializer.read_bits<32>();
+		serializer.set_current_bit_index(row_offsets_pointer + to_skip);
+		#else
 		for (int component = 0; component < 3; ++component) {
 			for (smm y = 0; y < mip_size.y; ++y) {
 				thread_pool += [=] () mutable {
@@ -1059,6 +1305,7 @@ Image decode(BitSerializer &serializer) {
 		serializer.skip((mip_size.y * 3) * 32);
 		u64 to_skip = serializer.read_bits<32>();
 		serializer.set_current_bit_index(row_offsets_pointer + to_skip);
+		#endif
 	}
 	
 	if (is_p2_square) {
@@ -1262,10 +1509,11 @@ s32 tl_main(Span<String> args) {
 		println("Format|Size|Percentage|Graph");
 		println("-|-|-|-");
 		for (auto b : benchmarks) {
-			println("{}|{}|{}%|{}",
-				b.name,
-				FormatFloat{.value = format_bytes(b.file_size), .precision = 1, .trailing_zeros = true},
-				b.file_size * 100 / benchmarks.back().file_size,
+			String w = b.name == "tim" ? u8"`"s : u8" "s;
+			println("{}{}{}|{}{}{}|{}{}%{}|{}",
+				w, b.name, w,
+				w, FormatFloat{.value = format_bytes(b.file_size), .precision = 1, .trailing_zeros = true}, w,
+				w, b.file_size * 100 / benchmarks.back().file_size, w,
 				Repeat{u8"█", ceiled_div(b.file_size * 20, benchmarks.back().file_size)}
 			);
 		}
@@ -1275,10 +1523,11 @@ s32 tl_main(Span<String> args) {
 		println("Format|Dec. speed|Percentage|Graph");
 		println("-|-|-|-");
 		for (auto b : benchmarks) {
-			println("{}|{}/s|{}%|{}",
-				b.name,
-				FormatFloat{.value = format_bytes(b.load_speed()), .precision = 0},
-				(u64)b.load_speed() * 100 / (u64)benchmarks.front().load_speed(),
+			String w = b.name == "tim" ? u8"`"s : u8" "s;
+			println("{}{}{}|{}{}/s{}|{}{}%{}|{}",
+				w, b.name, w,
+				w, FormatFloat{.value = format_bytes(b.load_speed()), .precision = 0}, w,
+				w, (u64)b.load_speed() * 100 / (u64)benchmarks.front().load_speed(), w,
 				Repeat{u8"█", ceiled_div(b.load_speed() * 20, benchmarks.front().load_speed())}
 			);
 		}
@@ -1288,10 +1537,11 @@ s32 tl_main(Span<String> args) {
 		println("Format|Enc. speed|Percentage|Graph");
 		println("-|-|-|-");
 		for (auto b : benchmarks) {
-			println("{}|{}/s|{}%|{}",
-				b.name,
-				FormatFloat{.value = format_bytes(b.store_speed()), .precision = 0},
-				(u64)b.store_speed() * 100 / (u64)benchmarks.front().store_speed(),
+			String w = b.name == "tim" ? u8"`"s : u8" "s;
+			println("{}{}{}|{}{}/s{}|{}{}%{}|{}",
+				w, b.name, w,
+				w, FormatFloat{.value = format_bytes(b.store_speed()), .precision = 0}, w,
+				w, (u64)b.store_speed() * 100 / (u64)benchmarks.front().store_speed(), w,
 				Repeat{u8"█", ceiled_div(b.store_speed() * 20, benchmarks.front().store_speed())}
 			);
 		}
