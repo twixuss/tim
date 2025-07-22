@@ -694,10 +694,12 @@ umm allocate_row_offsets(BitSerializer &serializer, Image image) {
 	return pointer;
 }
 
-void write_deltas(BitSerializer &serializer, Image image, Pixel *mids, umm row_offsets_pointer, int mip_level) {
+void write_deltas(BitSerializer &serializer, Image image, Pixel *mids, umm row_offsets_pointer) {
 	u64 avg_bits_required = 0;
 	u64 avg_bits_required_div = 0;
 	
+	umm bits_before = serializer.current_bit_index();
+
 	#if THREADED_ENCODING
 	List<BitSerializer> serializers;
 	defer {
@@ -716,8 +718,8 @@ void write_deltas(BitSerializer &serializer, Image image, Pixel *mids, umm row_o
 	for (int component = 0; component < 3; ++component) {
 		for (smm y = 0; y < image.size.y / 2; ++y) {
 			#if !THREADED_ENCODING
-			// Write the pointer to the beggining of this row in previously allocated table.
-			serializer.write_bits_at<32>(row_offsets_pointer + (component*image.size.y/2 + y)*32, serializer.current_bit_index());
+			// In previously allocated table write the number of bits needed to skip to get to the beggining of this row.
+			serializer.write_bits_at<32>(row_offsets_pointer + (component*image.size.y/2 + y)*32, serializer.current_bit_index() - row_offsets_pointer);
 			#endif
 
 			#if THREADED_ENCODING
@@ -857,35 +859,87 @@ void write_deltas(BitSerializer &serializer, Image image, Pixel *mids, umm row_o
 	}
 	#endif
 
-	serializer.write_bits_at<32>(row_offsets_pointer + (3*image.size.y/2)*32, serializer.current_bit_index());
+	serializer.write_bits_at<32>(row_offsets_pointer + (3*image.size.y/2)*32, serializer.current_bit_index() - row_offsets_pointer);
 
-	//println("{}: avg bits: {}", mip_level, (f64)avg_bits_required / avg_bits_required_div);
+	umm uncompressed_size = image.size.x * image.size.y * 24;
+	umm written_bits = serializer.current_bit_index() - bits_before;
+
+	//println("avg bits: {}. worth? {}", (f64)avg_bits_required / avg_bits_required_div, written_bits < uncompressed_size);
 }
 
-void encode_mip(BitSerializer &serializer, Image image, int mip_level = 0) {
-	Pixel *mids = compute_mids(image);
-	defer { DefaultAllocator{}.free(mids); };
+constexpr int max_mip_count = 32;
+constexpr int mip_count_field_size = log2(max_mip_count);
 
-	if (image.size.x == 2) {
-		serializer.write_bits<8>(mids[0].x);
-		serializer.write_bits<8>(mids[0].y);
-		serializer.write_bits<8>(mids[0].z);
-	} else {
-		encode_mip(serializer, {mids, image.size / 2}, mip_level + 1);
-	}
-
-	auto row_offsets_pointer = allocate_row_offsets(serializer, image);
-
-	write_deltas(serializer, image, mids, row_offsets_pointer, mip_level);
-}
-
-void encode(BitSerializer &serializer, Image in, v2u unpadded_size) {
+void encode(BitSerializer &serializer, Image image, v2u unpadded_size) {
 	profile();
 
 	serializer.write_bits<32>(unpadded_size.x);
 	serializer.write_bits<32>(unpadded_size.y);
 
-	encode_mip(serializer, in);
+	auto mip_count_pointer = serializer.current_bit_index();
+	serializer.skip(mip_count_field_size);
+	
+	struct Mip {
+		Image image;
+		Image mids;
+		BitSerializer deltas;
+	};
+	List<Mip> mips;
+	defer { 
+		for (auto &mip : mips) {
+			DefaultAllocator{}.free(mip.mids.pixels);
+		}
+		free(mips);
+	};
+
+
+	Image mids_src = image;
+	while (mids_src.size.x != 1) {
+		Mip mip;
+		mip.image = mids_src;
+		mip.mids = {compute_mids(mids_src), mids_src.size / 2};
+		mips.add(mip);
+		mids_src = mip.mids;
+	}
+	
+	umm min_compressed_size = image.size.x * image.size.y * 24;
+	umm deltas_sum = 0;
+	int mips_to_write = 0;
+
+	for (int mip_level = 0; mip_level < mips.count; ++mip_level) {
+		auto &mip = mips[mip_level];
+
+		umm mids_size = mip.mids.size.x * mip.mids.size.y * 3 * 8;
+
+		mip.deltas.buffer = mip.deltas.cursor = DefaultAllocator{}.allocate<u8>(mids_size * 4 * 2 / 8);
+
+		umm row_offsets_pointer = allocate_row_offsets(mip.deltas, mip.image);
+
+		write_deltas(mip.deltas, mip.image, mip.mids.pixels, row_offsets_pointer);
+
+		auto deltas_size = mip.deltas.current_bit_index();;
+	
+		deltas_sum += deltas_size;
+
+		umm compressed_size = deltas_sum + mids_size;
+
+		if (compressed_size < min_compressed_size) {
+			min_compressed_size = compressed_size;
+			mips_to_write = mip_level + 1;
+		}
+	}
+
+	serializer.write_bits_at<mip_count_field_size>(mip_count_pointer, mips_to_write);
+
+	Image last_mip = mips_to_write ? mips[mips_to_write-1].mids : image;
+	for (umm i = 0; i < last_mip.size.x * last_mip.size.y; ++i) {
+	    serializer.write_bits<24>(*(u32 *)&last_mip.pixels[i]);
+	}
+
+	for (int mip_level = mips_to_write - 1; mip_level >= 0; --mip_level) {
+		auto &mip = mips[mip_level];
+		serializer.write_bits(mip.deltas);
+	}
 }
 
 Image pad_to_power_of_2(Image image) {
@@ -906,6 +960,7 @@ Image decode(BitSerializer &serializer) {
 	v2u unpadded_size;
 	unpadded_size.x = serializer.read_bits<32>();
 	unpadded_size.y = serializer.read_bits<32>();
+	auto saved_mip_count = serializer.read_bits<mip_count_field_size>();
 
 
 	Image out = {};
@@ -922,24 +977,33 @@ Image decode(BitSerializer &serializer) {
 	auto buffer_in  = DefaultAllocator{}.allocate<Pixel>(padded_dim * padded_dim + 64);
 	auto buffer_out = DefaultAllocator{}.allocate<Pixel>(padded_dim * padded_dim + 64);
 
-	buffer_out[0].s[0] = serializer.read_bits<8>();
-	buffer_out[0].s[1] = serializer.read_bits<8>();
-	buffer_out[0].s[2] = serializer.read_bits<8>();
+	umm mip_count = log(padded_dim, 2);
+
+	umm initial_mids_dim = 1 << (mip_count - saved_mip_count);
+	for (umm y = 0; y < initial_mids_dim; ++y) {
+	for (umm x = 0; x < initial_mids_dim; ++x) {
+		*(u32 *)&buffer_out[y*padded_dim + x] = serializer.read_bits<24>();
+		//buffer_out[i].s[0] = serializer.read_bits<8>();
+		//buffer_out[i].s[1] = serializer.read_bits<8>();
+		//buffer_out[i].s[2] = serializer.read_bits<8>();
+	}
+	}
 	
-	umm mip_count = log(padded_dim, 2) + 1;
-	for (umm i = 1; i < mip_count; ++i) {
-		auto mip_size = V2u(::pow(2, i));
+	for (umm i = mip_count - saved_mip_count; i < mip_count; ++i) {
+		auto mip_size = V2u(1 << i);
 
 		std::swap(buffer_in, buffer_out);
 
+		umm row_offsets_pointer = serializer.current_bit_index();
+
 		for (int component = 0; component < 3; ++component) {
-			for (smm y = 0; y < mip_size.y / 2; ++y) {
+			for (smm y = 0; y < mip_size.y; ++y) {
 				thread_pool += [=] () mutable {
-					serializer.skip((component * mip_size.y / 2 + y) * 32);
+					serializer.skip((component * mip_size.y + y) * 32);
 					u64 offset = serializer.current_bit_index();
-					u64 skip_to = serializer.read_bits<32>();
-					serializer.set_current_bit_index(skip_to);
-					for (smm x = 0; x < mip_size.x / 2; ++x) {
+					u64 to_skip = serializer.read_bits<32>();
+					serializer.set_current_bit_index(row_offsets_pointer + to_skip);
+					for (smm x = 0; x < mip_size.x; ++x) {
 						u8 mid = buffer_in[y * padded_dim + x].s[component];
 						s8 deltas[2*2];
 
@@ -992,9 +1056,9 @@ Image decode(BitSerializer &serializer) {
 		}
 		thread_pool.wait_for_completion(WaitForCompletionOption::do_any_task);
 	
-		serializer.skip((mip_size.y / 2 * 3) * 32);
-		u64 skip_ro = serializer.read_bits<32>();
-		serializer.set_current_bit_index(skip_ro);
+		serializer.skip((mip_size.y * 3) * 32);
+		u64 to_skip = serializer.read_bits<32>();
+		serializer.set_current_bit_index(row_offsets_pointer + to_skip);
 	}
 	
 	if (is_p2_square) {
@@ -1055,7 +1119,7 @@ s32 tl_main(Span<String> args) {
 	set_console_encoding(Encoding::utf8);
 
 	//thread_pool.init(0);
-	thread_pool.init(get_cpu_info().logical_processor_count - 2);
+	thread_pool.init(get_cpu_info().logical_processor_count - 1);
 	defer { thread_pool.deinit(); };
 
 	if (args.count == 1) {
@@ -1166,29 +1230,29 @@ s32 tl_main(Span<String> args) {
 		    /*free */[&](void *pixels) { return stbi_image_free(pixels); }
 		);
 		
-		//run_benchmark("png", 
-		//    /*load */[&](Span<u8> file) { return stbi_load_from_memory(file.data, file.count, &x, &y, 0, 3); },
-		//    /*store*/[&](stbi_uc *pixels) { return stbi_write_png_to_func(write_func, &output_cursor, x, y, 3, pixels, x * 3); },
-		//    /*free */[&](void *pixels) { return stbi_image_free(pixels); }
-		//);
-		//
-		//run_benchmark("jpg", 
-		//    /*load */[&](Span<u8> file) { return stbi_load_from_memory(file.data, file.count, &x, &y, 0, 3); },
-		//    /*store*/[&](stbi_uc *pixels) { return stbi_write_jpg_to_func(write_func, &output_cursor, x, y, 3, pixels, 100); },
-		//    /*free */[&](void *pixels) { return stbi_image_free(pixels); }
-		//);
-		//
-		//run_benchmark("tga", 
-		//    /*load */[&](Span<u8> file) { return stbi_load_from_memory(file.data, file.count, &x, &y, 0, 3); },
-		//    /*store*/[&](stbi_uc *pixels) { return stbi_write_tga_to_func(write_func, &output_cursor, x, y, 3, pixels); },
-		//    /*free */[&](void *pixels) { return stbi_image_free(pixels); }
-		//);
-		//
-		//run_benchmark("qoi", 
-		//    /*load */[&](Span<u8> file) { return qoi::decode(file).value(); },
-		//    /*store*/[&](qoi::Image img) { qoi::encode(img.pixels, img.size); },
-		//    /*free */[&](qoi::Image &pixels) { return qoi::free(pixels); }
-		//);
+		run_benchmark("png", 
+		    /*load */[&](Span<u8> file) { return stbi_load_from_memory(file.data, file.count, &x, &y, 0, 3); },
+		    /*store*/[&](stbi_uc *pixels) { return stbi_write_png_to_func(write_func, &output_cursor, x, y, 3, pixels, x * 3); },
+		    /*free */[&](void *pixels) { return stbi_image_free(pixels); }
+		);
+		
+		run_benchmark("jpg", 
+		    /*load */[&](Span<u8> file) { return stbi_load_from_memory(file.data, file.count, &x, &y, 0, 3); },
+		    /*store*/[&](stbi_uc *pixels) { return stbi_write_jpg_to_func(write_func, &output_cursor, x, y, 3, pixels, 100); },
+		    /*free */[&](void *pixels) { return stbi_image_free(pixels); }
+		);
+		
+		run_benchmark("tga", 
+		    /*load */[&](Span<u8> file) { return stbi_load_from_memory(file.data, file.count, &x, &y, 0, 3); },
+		    /*store*/[&](stbi_uc *pixels) { return stbi_write_tga_to_func(write_func, &output_cursor, x, y, 3, pixels); },
+		    /*free */[&](void *pixels) { return stbi_image_free(pixels); }
+		);
+		
+		run_benchmark("qoi", 
+		    /*load */[&](Span<u8> file) { return qoi::decode(file).value(); },
+		    /*store*/[&](qoi::Image img) { qoi::encode(img.pixels, img.size); },
+		    /*free */[&](qoi::Image &pixels) { return qoi::free(pixels); }
+		);
 
 		auto ceiled_div = [](umm a, umm b) {
 			return (a + b - 1) / b;
